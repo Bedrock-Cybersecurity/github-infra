@@ -126,5 +126,5 @@ jobs:
       - name: Upload SBOM to audit S3
         run: |
           aws s3 cp sbom.spdx.json \
-            "s3://cirius-audit-evidence-prod/sboms/${{ inputs.ecr_repo }}/${IMAGE_SHA}.spdx.json"
+            "s3://bedrock-audit-evidence-prod/sboms/${{ inputs.ecr_repo }}/${IMAGE_SHA}.spdx.json"
           echo "SBOM uploaded to audit bucket"
