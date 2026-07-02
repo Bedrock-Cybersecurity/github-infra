@@ -16,7 +16,9 @@ name: bedrock-deploy-pipeline (reusable)
 # Required inputs:  app_name, ecr_repo, deploy_role_arn, alb_name
 # Required secrets: BEDROCK_SDK_TOKEN
 # Optional inputs:  vendor_sdk, run_migrations, ecs_sg_name,
-#                   workflow_filename, free_runner_disk
+#                   workflow_filename, free_runner_disk,
+#                   codedeploy_app, codedeploy_group, gate_lambda,
+#                   cluster, task_family, container_name, container_port
 # Optional secrets: GH_PACKAGES_TOKEN, SOC_API_URL, SOC_API_KEY
 
 on:
@@ -63,6 +65,41 @@ on:
         required: false
         type: boolean
         default: false
+      codedeploy_app:
+        description: "CodeDeploy application name. Defaults to app_name (product-factory apps differ)."
+        required: false
+        type: string
+        default: ""
+      codedeploy_group:
+        description: "CodeDeploy deployment group name. Defaults to app_name (product-factory apps differ)."
+        required: false
+        type: string
+        default: ""
+      gate_lambda:
+        description: "BeforeAllowTraffic Lambda name. Defaults to {app_name}-deploy-gate."
+        required: false
+        type: string
+        default: ""
+      cluster:
+        description: "ECS cluster name. Defaults to cirius-orchestrator-prod."
+        required: false
+        type: string
+        default: "cirius-orchestrator-prod"
+      task_family:
+        description: "ECS task definition family. Defaults to app_name."
+        required: false
+        type: string
+        default: ""
+      container_name:
+        description: "Container name in the task definition. Defaults to app_name."
+        required: false
+        type: string
+        default: ""
+      container_port:
+        description: "Container port."
+        required: false
+        type: string
+        default: "8000"
     secrets:
       BEDROCK_SDK_TOKEN:
         required: true
@@ -131,6 +168,13 @@ jobs:
       alb_name:        ${{ inputs.alb_name }}
       run_migrations:  ${{ inputs.run_migrations }}
       ecs_sg_name:     ${{ inputs.ecs_sg_name }}
+      codedeploy_app:  ${{ inputs.codedeploy_app }}
+      codedeploy_group: ${{ inputs.codedeploy_group }}
+      gate_lambda:     ${{ inputs.gate_lambda }}
+      cluster:         ${{ inputs.cluster }}
+      task_family:     ${{ inputs.task_family }}
+      container_name:  ${{ inputs.container_name }}
+      container_port:  ${{ inputs.container_port }}
     secrets:
       SOC_API_URL: ${{ secrets.SOC_API_URL }}
       SOC_API_KEY: ${{ secrets.SOC_API_KEY }}
