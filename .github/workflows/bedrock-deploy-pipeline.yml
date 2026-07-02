@@ -1,0 +1,136 @@
+name: bedrock-deploy-pipeline (reusable)
+
+# Canonical Bedrock deploy pipeline — single reusable workflow that every
+# service app calls. Encapsulates all four stages:
+#
+#   drift-gate   — skip if scheduled and prod already at HEAD
+#   scanner      — bedrock-scanner full suite (workflow_dispatch only;
+#                  push = PR already passed the required scanner check)
+#   build        — Docker build + ECR1 push (unverified)
+#   deploy       — optional Alembic migration, CodeDeploy create → EXIT
+#
+# After EXIT: BeforeAllowTraffic gate Lambda runs on Kobe:
+#   nuclei unauth → ZAP baseline → attack-team authed pentest → flip or rollback.
+# After DEPLOYMENT_SUCCEEDED: EventBridge → promote.yml (SBOM + cosign + ECR2).
+#
+# Required inputs:  app_name, ecr_repo, deploy_role_arn, alb_name
+# Required secrets: BEDROCK_SDK_TOKEN
+# Optional inputs:  vendor_sdk, run_migrations, ecs_sg_name,
+#                   workflow_filename, free_runner_disk
+# Optional secrets: GH_PACKAGES_TOKEN, SOC_API_URL, SOC_API_KEY
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App slug (e.g. bedrock-hub). Used as CodeDeploy app/group name and image label."
+        required: true
+        type: string
+      ecr_repo:
+        description: "ECR repository name (e.g. bedrock-hub)."
+        required: true
+        type: string
+      deploy_role_arn:
+        description: "IAM role ARN assumed via OIDC for ECR push + CodeDeploy access."
+        required: true
+        type: string
+      alb_name:
+        description: "ALB name for resolving the :8080 test URL (e.g. bedrock-platform-hub)."
+        required: true
+        type: string
+      vendor_sdk:
+        description: "Check out bedrock-sdk to vendor/bedrock-sdk before building."
+        required: false
+        type: boolean
+        default: false
+      run_migrations:
+        description: "Run alembic upgrade head as a one-off ECS task before deploying."
+        required: false
+        type: boolean
+        default: false
+      ecs_sg_name:
+        description: "ECS security group name (needed when run_migrations=true)."
+        required: false
+        type: string
+        default: ""
+      workflow_filename:
+        description: "This workflow's filename, used by the drift-gate schedule check (e.g. deploy.yml)."
+        required: false
+        type: string
+        default: "deploy.yml"
+      free_runner_disk:
+        description: "Free runner disk before build (remove unused toolchains; set true for large images)."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      BEDROCK_SDK_TOKEN:
+        required: true
+      GH_PACKAGES_TOKEN:
+        required: false
+      SOC_API_URL:
+        required: false
+      SOC_API_KEY:
+        required: false
+
+jobs:
+  drift-gate:
+    name: Drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      deploy: ${{ steps.drift.outputs.deploy }}
+    steps:
+      - name: Check if prod already at HEAD
+        id: drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          LAST=$(gh api "repos/${{ github.repository }}/actions/workflows/${{ inputs.workflow_filename }}/runs?branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha' 2>/dev/null || echo "none")
+          if [ "$LAST" = "${{ github.sha }}" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+  scanner:
+    name: bedrock-scanner
+    needs: drift-gate
+    if: needs.drift-gate.outputs.deploy == 'true' && github.event_name == 'workflow_dispatch'
+    uses: Bedrock-Cybersecurity/github-infra/.github/workflows/bedrock-scanner-gate.yml@main
+    secrets:
+      BEDROCK_SDK_TOKEN: ${{ secrets.BEDROCK_SDK_TOKEN }}
+
+  build:
+    name: Build + ECR1 push
+    needs: [drift-gate, scanner]
+    if: needs.drift-gate.outputs.deploy == 'true' && (needs.scanner.result == 'success' || needs.scanner.result == 'skipped')
+    uses: Bedrock-Cybersecurity/github-infra/.github/workflows/bedrock-ecr-build-push.yml@main
+    with:
+      app_name:        ${{ inputs.app_name }}
+      ecr_repo:        ${{ inputs.ecr_repo }}
+      deploy_role_arn: ${{ inputs.deploy_role_arn }}
+      vendor_sdk:      ${{ inputs.vendor_sdk }}
+      free_runner_disk: ${{ inputs.free_runner_disk }}
+    secrets:
+      BEDROCK_SDK_TOKEN: ${{ secrets.BEDROCK_SDK_TOKEN }}
+      GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+
+  deploy:
+    name: CodeDeploy create
+    needs: build
+    if: needs.build.result == 'success'
+    uses: Bedrock-Cybersecurity/github-infra/.github/workflows/bedrock-codedeploy-create.yml@main
+    with:
+      app_name:        ${{ inputs.app_name }}
+      deploy_role_arn: ${{ inputs.deploy_role_arn }}
+      alb_name:        ${{ inputs.alb_name }}
+      run_migrations:  ${{ inputs.run_migrations }}
+      ecs_sg_name:     ${{ inputs.ecs_sg_name }}
+    secrets:
+      SOC_API_URL: ${{ secrets.SOC_API_URL }}
+      SOC_API_KEY: ${{ secrets.SOC_API_KEY }}

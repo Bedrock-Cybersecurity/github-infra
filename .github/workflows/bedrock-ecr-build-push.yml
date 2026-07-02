@@ -5,7 +5,7 @@ name: bedrock-ecr-build-push (reusable)
 #
 # Required inputs:  app_name, ecr_repo, deploy_role_arn
 # Required secrets: BEDROCK_SDK_TOKEN
-# Optional inputs:  aws_account, aws_region, vendor_sdk
+# Optional inputs:  aws_account, aws_region, vendor_sdk, free_runner_disk
 # Optional secrets: GH_PACKAGES_TOKEN — pass when the Dockerfile has a bun frontend stage
 #                   that installs @bedrock-cybersecurity/* from GitHub Packages. Forwarded
 #                   as --build-arg BUN_AUTH_TOKEN. Omit for apps without a frontend stage.
@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: false
+      free_runner_disk:
+        description: "Free runner disk before build (remove unused toolchains; set true for large images like bedrock-scanner)."
+        required: false
+        type: boolean
+        default: false
     secrets:
       BEDROCK_SDK_TOKEN:
         required: true
@@ -65,6 +70,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - name: Free runner disk
+        if: inputs.free_runner_disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
 
       - name: Vendor bedrock-sdk
         if: inputs.vendor_sdk
