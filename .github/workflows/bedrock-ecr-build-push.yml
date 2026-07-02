@@ -1,0 +1,104 @@
+name: bedrock-ecr-build-push (reusable)
+
+# Build a Docker image and push it to the app's ECR1 (internal/deployment)
+# repository. Outputs the full image URI with SHA tag for downstream jobs.
+#
+# Required inputs:  app_name, ecr_repo, deploy_role_arn
+# Required secrets: BEDROCK_SDK_TOKEN
+# Optional inputs:  aws_account, aws_region, vendor_sdk
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App slug (e.g. bedrock-hub). Used in image labels and descriptions."
+        required: true
+        type: string
+      ecr_repo:
+        description: "ECR repository name (e.g. bedrock-hub, mcp)."
+        required: true
+        type: string
+      deploy_role_arn:
+        description: "IAM role ARN assumed via OIDC for ECR push."
+        required: true
+        type: string
+      aws_account:
+        description: "AWS account ID."
+        required: false
+        type: string
+        default: "863609217450"
+      aws_region:
+        description: "AWS region."
+        required: false
+        type: string
+        default: us-west-2
+      vendor_sdk:
+        description: "Check out bedrock-sdk to vendor/bedrock-sdk before building (for apps that COPY vendor/)."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      BEDROCK_SDK_TOKEN:
+        required: true
+    outputs:
+      image_sha:
+        description: "The full git SHA used to tag the pushed image."
+        value: ${{ jobs.build.outputs.image_sha }}
+      image_uri:
+        description: "Full ECR1 image URI including SHA tag."
+        value: ${{ jobs.build.outputs.image_uri }}
+
+jobs:
+  build:
+    name: Build + push to ECR1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image_sha: ${{ github.sha }}
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Vendor bedrock-sdk
+        if: inputs.vendor_sdk
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: Bedrock-Cybersecurity/bedrock-sdk
+          token: ${{ secrets.BEDROCK_SDK_TOKEN }}
+          path: vendor/bedrock-sdk
+          persist-credentials: false
+
+      - name: AWS creds (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ inputs.deploy_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: ECR login
+        run: |
+          aws ecr get-login-password --region "${{ inputs.aws_region }}" \
+            | docker login --username AWS --password-stdin \
+              "${{ inputs.aws_account }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com"
+
+      - name: Build + push
+        id: push
+        env:
+          BEDROCK_SDK_TOKEN: ${{ secrets.BEDROCK_SDK_TOKEN }}
+          ECR: ${{ inputs.aws_account }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${{ inputs.ecr_repo }}
+        run: |
+          docker buildx create --use --name ci-builder --driver docker-container 2>/dev/null || true
+          docker buildx build \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
+            --secret     id=github_token,env=BEDROCK_SDK_TOKEN \
+            --build-arg  BEDROCK_SDK_TOKEN="${BEDROCK_SDK_TOKEN}" \
+            --load \
+            -t "${ECR}:${{ github.sha }}" \
+            -t "${ECR}:latest" \
+            .
+          docker push "${ECR}:${{ github.sha }}"
+          docker push "${ECR}:latest"
+          echo "image_uri=${ECR}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${ECR}:${{ github.sha }}"

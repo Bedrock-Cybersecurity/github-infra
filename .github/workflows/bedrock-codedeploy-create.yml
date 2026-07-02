@@ -1,0 +1,202 @@
+name: bedrock-codedeploy-create (reusable)
+
+# Resolves VPC networking, optionally runs Alembic migrations as a one-off
+# ECS task, creates a CodeDeploy blue/green deployment, and exits. The
+# BeforeAllowTraffic gate Lambda (bedrock-infra *_deploy_gate.tf) runs the
+# DAST + pen-test + smoke gauntlet on Kobe and drives the flip or rollback.
+#
+# Required inputs:  app_name, deploy_role_arn, alb_name
+# Required secrets: SOC_API_URL, SOC_API_KEY (for failure alerting)
+# Optional inputs:  run_migrations, aws_region, aws_account, cluster,
+#                   task_family, container_name, container_port,
+#                   ecs_sg_name, subnet_names
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App slug (e.g. bedrock-hub). Used as the CodeDeploy app and group name."
+        required: true
+        type: string
+      deploy_role_arn:
+        description: "IAM role ARN assumed via OIDC for CodeDeploy + ECS access."
+        required: true
+        type: string
+      alb_name:
+        description: "ALB name for resolving the :8080 test URL (e.g. bedrock-platform-hub)."
+        required: true
+        type: string
+      run_migrations:
+        description: "Run alembic upgrade head as a one-off ECS task before deploying."
+        required: false
+        type: boolean
+        default: false
+      aws_region:
+        description: "AWS region."
+        required: false
+        type: string
+        default: us-west-2
+      aws_account:
+        description: "AWS account ID."
+        required: false
+        type: string
+        default: "863609217450"
+      cluster:
+        description: "ECS cluster name."
+        required: false
+        type: string
+        default: cirius-orchestrator-prod
+      task_family:
+        description: "ECS task definition family. Defaults to app_name."
+        required: false
+        type: string
+        default: ""
+      container_name:
+        description: "Container name in the task definition. Defaults to app_name."
+        required: false
+        type: string
+        default: ""
+      container_port:
+        description: "Container port."
+        required: false
+        type: string
+        default: "8000"
+      ecs_sg_name:
+        description: "ECS security group name (needed when run_migrations=true)."
+        required: false
+        type: string
+        default: ""
+      subnet_names:
+        description: "Comma-separated private subnet names (needed when run_migrations=true)."
+        required: false
+        type: string
+        default: "cirius-platform-runner-private,cirius-platform-private-b"
+    secrets:
+      SOC_API_URL:
+        required: false
+      SOC_API_KEY:
+        required: false
+    outputs:
+      deployment_id:
+        description: "CodeDeploy deployment ID."
+        value: ${{ jobs.deploy.outputs.deployment_id }}
+
+jobs:
+  deploy:
+    name: CodeDeploy create-deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      deployment_id: ${{ steps.codedeploy.outputs.deployment_id }}
+    env:
+      AWS_REGION:     ${{ inputs.aws_region }}
+      AWS_ACCOUNT:    ${{ inputs.aws_account }}
+      CLUSTER:        ${{ inputs.cluster }}
+      TASK_FAMILY:    ${{ inputs.task_family != '' && inputs.task_family || inputs.app_name }}
+      CONTAINER_NAME: ${{ inputs.container_name != '' && inputs.container_name || inputs.app_name }}
+      CONTAINER_PORT: ${{ inputs.container_port }}
+      ALB_NAME:       ${{ inputs.alb_name }}
+      ECS_SG_NAME:    ${{ inputs.ecs_sg_name }}
+      SUBNET_NAMES:   ${{ inputs.subnet_names }}
+    steps:
+      - name: AWS creds (OIDC)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ inputs.deploy_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Resolve VPC networking + ALB test URL
+        id: net
+        run: |
+          VPC=$(aws ec2 describe-vpcs \
+            --filters "Name=cidr,Values=10.99.0.0/16" \
+            --query 'Vpcs[0].VpcId' --output text)
+          if [ -n "$ECS_SG_NAME" ]; then
+            SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC" "Name=tag:Name,Values=${SUBNET_NAMES}" \
+              --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+            SG=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC" "Name=group-name,Values=${ECS_SG_NAME}" \
+              --query 'SecurityGroups[0].GroupId' --output text)
+            echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+            echo "sg=$SG"           >> "$GITHUB_OUTPUT"
+          fi
+          ALB=$(aws elbv2 describe-load-balancers \
+            --names "${ALB_NAME}" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "test_url=http://${ALB}:8080" >> "$GITHUB_OUTPUT"
+          echo "ALB test URL: http://${ALB}:8080"
+
+      - name: Alembic upgrade (in-VPC one-off ECS task)
+        if: inputs.run_migrations
+        run: |
+          set -euo pipefail
+          NET="awsvpcConfiguration={subnets=[${{ steps.net.outputs.subnets }}],securityGroups=[${{ steps.net.outputs.sg }}],assignPublicIp=DISABLED}"
+          OVERRIDES='{"containerOverrides":[{"name":"'"${CONTAINER_NAME}"'","command":["sh","-c","export DATABASE_URL=$(echo \"$DATABASE_URL\" | sed s/+asyncpg//); alembic upgrade head"]}]}'
+          TASK=$(aws ecs run-task \
+            --cluster "$CLUSTER" --task-definition "$TASK_FAMILY" \
+            --launch-type FARGATE --network-configuration "$NET" \
+            --overrides "$OVERRIDES" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "migration task: $TASK"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK"
+          EXIT=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          REASON=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+            --query 'tasks[0].stoppedReason' --output text)
+          echo "migration exit=$EXIT reason=$REASON"
+          [ "$EXIT" = "0" ] || { echo "::error::alembic migration failed (exit $EXIT)"; exit 1; }
+
+      - name: Create CodeDeploy deployment
+        id: codedeploy
+        env:
+          CD_APP:   ${{ inputs.app_name }}
+          CD_GROUP: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          TASK_DEF_ARN=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_FAMILY}" --region "${AWS_REGION}" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Deploying task def ${TASK_DEF_ARN}"
+
+          GATE_HOOK="${{ inputs.app_name }}-deploy-gate"
+          APPSPEC=$(jq -nc \
+            --arg td "${TASK_DEF_ARN}" \
+            --arg c  "${CONTAINER_NAME}" \
+            --argjson p "${CONTAINER_PORT}" \
+            --arg hook "${GATE_HOOK}" '
+            {
+              version: "0.0",
+              Resources: [{ TargetService: { Type: "AWS::ECS::Service", Properties: {
+                TaskDefinition: $td,
+                LoadBalancerInfo: { ContainerName: $c, ContainerPort: $p }
+              }}}],
+              Hooks: [{ BeforeAllowTraffic: $hook }]
+            }')
+          REVISION=$(jq -nc --arg a "${APPSPEC}" \
+            '{ revisionType: "AppSpecContent", appSpecContent: { content: $a } }')
+
+          DEP_ID=$(aws deploy create-deployment \
+            --application-name  "${CD_APP}" \
+            --deployment-group-name "${CD_GROUP}" \
+            --revision "${REVISION}" \
+            --description "${{ inputs.app_name }} ${GITHUB_SHA::7} run ${GITHUB_RUN_ID}" \
+            --region "${AWS_REGION}" \
+            --query 'deploymentId' --output text)
+          echo "deployment_id=${DEP_ID}" >> "${GITHUB_OUTPUT}"
+          echo "CodeDeploy deployment ${DEP_ID} created — gate Lambda drives flip/rollback."
+
+  alert_on_failure:
+    name: Alert bedrock-soc on deploy failure
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: failure()
+    steps:
+      - name: Post incident to bedrock-soc
+        run: |
+          curl -sf -X POST "${{ secrets.SOC_API_URL }}/api/incidents" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${{ secrets.SOC_API_KEY }}" \
+            -d "{\"title\":\"Deploy FAILED — ${{ inputs.app_name }} ${{ github.sha }}\",\"description\":\"Deploy workflow failed for ${{ inputs.app_name }} commit ${{ github.sha }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"severity\":\"HIGH\",\"source_system\":\"PROD\",\"ioc_key\":\"deploy-failure-PROD-${{ github.sha }}\"}" \
+            && echo "Incident posted to bedrock-soc" \
+            || echo "::warning::bedrock-soc alert skipped (SOC_API_URL not configured)"

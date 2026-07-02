@@ -1,0 +1,29 @@
+name: bedrock-scanner gate (reusable)
+
+# Pre-deploy security gate — runs the full bedrock-scanner suite (Secrets,
+# SAST, SCA, License, IaC, Container) before any image is built or deployed.
+# Ensures direct-to-main pushes and workflow_dispatch deploys go through the
+# same scan that PRs do.
+#
+# Required caller secret: BEDROCK_SDK_TOKEN
+
+on:
+  workflow_call:
+    secrets:
+      BEDROCK_SDK_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: bedrock-scanner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: Bedrock-Cybersecurity/bedrock-scanner/.github/actions/pr-scan@main
+        with:
+          bedrock-sdk-token: ${{ secrets.BEDROCK_SDK_TOKEN }}

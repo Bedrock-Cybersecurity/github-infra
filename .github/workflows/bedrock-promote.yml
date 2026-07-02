@@ -1,0 +1,130 @@
+name: bedrock-promote (reusable)
+
+# Post-deployment promotion: pulls the verified image from ECR1, generates an
+# SBOM with syft, signs the ECR2 image with cosign (Azure KMS), pushes to
+# ECR2 (the customer-facing distribution registry), attests the SBOM, and
+# uploads the SBOM to the audit S3 bucket.
+#
+# Triggered via workflow_dispatch from the bedrock-promote Lambda
+# (bedrock-infra-modules/modules/bedrock-promote) after CodeDeploy reports
+# DEPLOYMENT_SUCCEEDED via EventBridge. Never called on PRs or pushes.
+#
+# Required inputs:  app_name, ecr_repo, image_sha, deploy_role_arn
+# Required secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App slug (e.g. bedrock-hub)."
+        required: true
+        type: string
+      ecr_repo:
+        description: "ECR1 source repository name (e.g. bedrock-hub)."
+        required: true
+        type: string
+      image_sha:
+        description: "Full git SHA of the image to promote."
+        required: true
+        type: string
+      deploy_role_arn:
+        description: "IAM role ARN with ECR1 pull + ECR2 push + S3 write."
+        required: true
+        type: string
+      aws_account:
+        required: false
+        type: string
+        default: "863609217450"
+      aws_region:
+        required: false
+        type: string
+        default: us-west-2
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  promote:
+    name: SBOM + Cosign + ECR2 push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_REGION:  ${{ inputs.aws_region }}
+      AWS_ACCOUNT: ${{ inputs.aws_account }}
+      ECR1:        ${{ inputs.aws_account }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${{ inputs.ecr_repo }}
+      ECR2:        ${{ inputs.aws_account }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${{ inputs.ecr_repo }}-dist
+      IMAGE_SHA:   ${{ inputs.image_sha }}
+    steps:
+      - name: AWS creds (OIDC — promote role)
+        uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ inputs.deploy_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: ECR login
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin \
+              "${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Pull from ECR1
+        run: docker pull "${ECR1}:${IMAGE_SHA}"
+
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin v1.4.1
+
+      - name: Generate SBOM (SPDX-JSON)
+        run: syft "${ECR1}:${IMAGE_SHA}" -o spdx-json > sbom.spdx.json
+
+      - name: Azure login (for cosign Azure KMS signing)
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1d8af56953a4fd26bc164d65b56c2e12cf1235be # v4.1.1
+        with:
+          cosign-release: v2.4.1
+
+      - name: Tag + push to ECR2 (dist)
+        run: |
+          docker tag  "${ECR1}:${IMAGE_SHA}" "${ECR2}:${IMAGE_SHA}"
+          docker tag  "${ECR1}:${IMAGE_SHA}" "${ECR2}:latest"
+          docker push "${ECR2}:${IMAGE_SHA}"
+          docker push "${ECR2}:latest"
+          echo "Pushed ${ECR2}:${IMAGE_SHA}"
+
+      - name: Cosign sign ECR2 image (Azure KMS)
+        run: |
+          cosign sign --yes \
+            --key "azurekms://cirius-openai-kv-prod.vault.azure.net/cosign-signing-key-ec" \
+            --tlog-upload=false \
+            "${ECR2}:${IMAGE_SHA}"
+          echo "Signed ${ECR2}:${IMAGE_SHA}"
+
+      - name: Attest SBOM on ECR2 (Azure KMS)
+        run: |
+          cosign attest --yes \
+            --key "azurekms://cirius-openai-kv-prod.vault.azure.net/cosign-signing-key-ec" \
+            --type spdxjson --predicate sbom.spdx.json \
+            --tlog-upload=false \
+            "${ECR2}:${IMAGE_SHA}"
+          echo "SBOM attestation attached to ${ECR2}:${IMAGE_SHA}"
+
+      - name: Upload SBOM to audit S3
+        run: |
+          aws s3 cp sbom.spdx.json \
+            "s3://cirius-audit-evidence-prod/sboms/${{ inputs.ecr_repo }}/${IMAGE_SHA}.spdx.json"
+          echo "SBOM uploaded to audit bucket"
