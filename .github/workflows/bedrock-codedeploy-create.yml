@@ -8,6 +8,7 @@ name: bedrock-codedeploy-create (reusable)
 # Required inputs:  app_name, deploy_role_arn, alb_name
 # Required secrets: SOC_API_URL, SOC_API_KEY (for failure alerting)
 # Optional inputs:  run_migrations, aws_region, aws_account, cluster,
+#                   codedeploy_app, codedeploy_group, gate_lambda,
 #                   task_family, container_name, container_port,
 #                   ecs_sg_name, subnet_names
 
@@ -46,6 +47,21 @@ on:
         required: false
         type: string
         default: cirius-orchestrator-prod
+      codedeploy_app:
+        description: "CodeDeploy application name. Defaults to app_name (product-factory apps differ)."
+        required: false
+        type: string
+        default: ""
+      codedeploy_group:
+        description: "CodeDeploy deployment group name. Defaults to app_name (product-factory apps differ)."
+        required: false
+        type: string
+        default: ""
+      gate_lambda:
+        description: "BeforeAllowTraffic Lambda name. Defaults to {app_name}-deploy-gate."
+        required: false
+        type: string
+        default: ""
       task_family:
         description: "ECS task definition family. Defaults to app_name."
         required: false
@@ -150,8 +166,8 @@ jobs:
       - name: Create CodeDeploy deployment
         id: codedeploy
         env:
-          CD_APP:   ${{ inputs.app_name }}
-          CD_GROUP: ${{ inputs.app_name }}
+          CD_APP:   ${{ inputs.codedeploy_app != '' && inputs.codedeploy_app || inputs.app_name }}
+          CD_GROUP: ${{ inputs.codedeploy_group != '' && inputs.codedeploy_group || inputs.app_name }}
         run: |
           set -euo pipefail
           TASK_DEF_ARN=$(aws ecs describe-task-definition \
@@ -159,7 +175,8 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Deploying task def ${TASK_DEF_ARN}"
 
-          GATE_HOOK="${{ inputs.app_name }}-deploy-gate"
+          GATE_HOOK="${{ inputs.gate_lambda }}"
+          [ -z "${GATE_HOOK}" ] && GATE_HOOK="${{ inputs.app_name }}-deploy-gate"
           APPSPEC=$(jq -nc \
             --arg td "${TASK_DEF_ARN}" \
             --arg c  "${CONTAINER_NAME}" \
