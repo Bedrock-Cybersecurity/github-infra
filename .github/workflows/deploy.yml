@@ -1,4 +1,4 @@
-name: Terraform Deploy - github-infra
+name: Terraform Deploy - bedrock-github-infra
 
 on:
   push:
@@ -30,8 +30,8 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # CI role (206820231356) cross-account assumes into 863609217450 for S3 state.
-      # PREREQUISITE: add repo:Bedrock-Cybersecurity/github-infra:* to the
-      # github-deploy-main trust policy in aws-infra before first run.
+      # OIDC trust for repo:Bedrock-Cybersecurity/bedrock-github-infra:* is in
+      # aws-infra main/iam.tf (github-deploy-main trust policy).
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
@@ -40,7 +40,7 @@ jobs:
 
       # Org-admin GitHub App token for the Bedrock-Cybersecurity org. Store at
       # cirius/github-infra/terraform-token in AWS Secrets Manager (same token
-      # used by Cirius-Group-Inc/github-infra — it has admin on both orgs).
+      # used by Cirius-Group-Inc/cirius-github-infra — it has admin on both orgs).
       - name: Load GitHub token
         run: |
           TOKEN=$(aws secretsmanager get-secret-value \
