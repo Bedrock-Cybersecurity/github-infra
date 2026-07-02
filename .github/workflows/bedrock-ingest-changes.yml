@@ -1,0 +1,131 @@
+name: bedrock-ingest-changes (reusable)
+
+# Canonical change-management workflow — call this from every repo's
+# ingest-changes.yml instead of duplicating the logic. Classifies the change
+# type, builds the affected-systems list (logical dirs + Terraform resource
+# names), and posts a change record to the SecOps CM API (/api/changes/).
+#
+# Non-blocking by design: a SecOps outage warns but never fails the run.
+# Required caller secret: INGEST_API_KEY
+
+on:
+  workflow_call:
+    secrets:
+      INGEST_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ingest:
+    name: Post change record to SecOps
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 2
+
+      - name: Classify change type
+        id: classify
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          CHANGED=$(git diff --name-only HEAD^1 HEAD 2>/dev/null || echo "")
+          CHANGE_TYPE="SCRIPT"
+          if echo "$CHANGED" | grep -qE "\.(tf|tfvars)$"; then
+            CHANGE_TYPE="TERRAFORM"
+          fi
+          echo "change_type=$CHANGE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "Classified as: $CHANGE_TYPE (branch: $HEAD_BRANCH)"
+
+      - name: Build affected systems list
+        id: systems
+        run: |
+          CHANGED=$(git diff --name-only HEAD^1 HEAD 2>/dev/null || echo "")
+
+          PARTS=$(echo "$CHANGED" | awk -F/ 'NF>1{print $1} NF==1{print "root"}' \
+            | sort -u \
+            | python3 -c "import sys,json;print(json.dumps(sorted({l.strip() for l in sys.stdin if l.strip()})))")
+
+          TF_CHANGED=$(echo "$CHANGED" | grep '\.tf$' || true)
+          TF_RESOURCES="[]"
+          if [ -n "$TF_CHANGED" ]; then
+            _TFPY=$(mktemp)
+            cat > "$_TFPY" << 'PYEOF'
+          import sys, json, re
+          diff = sys.stdin.read()
+          resources = set()
+          for m in re.finditer(r'resource\s+"[a-z0-9_]+"\s+"([^"]+)"', diff):
+              resources.add(m.group(1).replace('_', '-'))
+          for m in re.finditer(r'^\+\s*(?:name|bucket|id)\s*=\s*"([a-z][a-z0-9\-]{3,})"', diff, re.MULTILINE):
+              resources.add(m.group(1))
+          print(json.dumps(sorted(resources)))
+          PYEOF
+            TF_RESOURCES=$(git diff HEAD^1 HEAD -- $TF_CHANGED 2>/dev/null | python3 "$_TFPY" || echo "[]")
+            rm -f "$_TFPY"
+          fi
+
+          MERGED=$(LOGICAL="$PARTS" TF_NAMES="$TF_RESOURCES" python3 -c \
+            "import json,os;a=json.loads(os.environ.get('LOGICAL','[]') or '[]');b=json.loads(os.environ.get('TF_NAMES','[]') or '[]');print(json.dumps(sorted(set(a+b))))" \
+            2>/dev/null || echo "$PARTS")
+
+          echo "systems=$MERGED" >> "$GITHUB_OUTPUT"
+          echo "Affected systems: $MERGED"
+
+      - name: Post change record
+        env:
+          SECOPS_API_KEY:   ${{ secrets.INGEST_API_KEY }}
+          SECOPS_URL:       https://soc.bedrockcybersecurity.org
+          PR_TITLE:         ${{ github.event.pull_request.title }}
+          PR_URL:           ${{ github.event.pull_request.html_url }}
+          PR_BODY:          ${{ github.event.pull_request.body }}
+          PR_ACTOR:         ${{ github.event.pull_request.user.login }}
+          PR_BRANCH:        ${{ github.event.pull_request.head.ref }}
+          PR_MERGE_SHA:     ${{ github.event.pull_request.merge_commit_sha }}
+          PR_MERGED_AT:     ${{ github.event.pull_request.merged_at }}
+          PR_REPO:          ${{ github.repository }}
+          CHANGE_TYPE:      ${{ steps.classify.outputs.change_type }}
+          AFFECTED_SYSTEMS: ${{ steps.systems.outputs.systems }}
+        run: |
+          _PY=$(mktemp)
+          cat > "$_PY" << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+          body = os.environ.get("PR_BODY", "") or ""
+          payload = {
+              "tenant_id":        "cirius",
+              "title":            os.environ["PR_TITLE"],
+              "change_type":      os.environ["CHANGE_TYPE"],
+              "status":           "APPLIED",
+              "repo":             os.environ["PR_REPO"],
+              "branch":           os.environ["PR_BRANCH"],
+              "commit_sha":       os.environ["PR_MERGE_SHA"],
+              "commit_message":   os.environ["PR_TITLE"],
+              "actor":            os.environ["PR_ACTOR"],
+              "pr_url":           os.environ["PR_URL"],
+              "affected_systems": json.loads(os.environ.get("AFFECTED_SYSTEMS", "[]") or "[]"),
+              "description":      body[:2000],
+              "applied_at":       os.environ["PR_MERGED_AT"],
+              "created_by":       "github-actions",
+          }
+          data = json.dumps(payload).encode()
+          url = os.environ["SECOPS_URL"].rstrip("/") + "/api/changes/"
+          req = urllib.request.Request(
+              url, data=data,
+              headers={"Content-Type": "application/json", "X-API-Key": os.environ["SECOPS_API_KEY"]},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"HTTP {resp.status}: {resp.read().decode()}")
+                  print("Change record created successfully.")
+          except urllib.error.HTTPError as e:
+              print(f"HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
+              print(f"::warning::Change record ingest returned HTTP {e.code} (non-fatal)")
+          except Exception as exc:
+              print(f"::warning::Change record ingest failed: {exc} (non-fatal)")
+          PYEOF
+          python3 "$_PY"
+          rm -f "$_PY"
