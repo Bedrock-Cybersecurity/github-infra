@@ -6,6 +6,9 @@ name: bedrock-ecr-build-push (reusable)
 # Required inputs:  app_name, ecr_repo, deploy_role_arn
 # Required secrets: BEDROCK_SDK_TOKEN
 # Optional inputs:  aws_account, aws_region, vendor_sdk
+# Optional secrets: GH_PACKAGES_TOKEN — pass when the Dockerfile has a bun frontend stage
+#                   that installs @bedrock-cybersecurity/* from GitHub Packages. Forwarded
+#                   as --build-arg BUN_AUTH_TOKEN. Omit for apps without a frontend stage.
 
 on:
   workflow_call:
@@ -40,6 +43,8 @@ on:
     secrets:
       BEDROCK_SDK_TOKEN:
         required: true
+      GH_PACKAGES_TOKEN:
+        required: false
     outputs:
       image_sha:
         description: "The full git SHA used to tag the pushed image."
@@ -86,14 +91,21 @@ jobs:
         id: push
         env:
           BEDROCK_SDK_TOKEN: ${{ secrets.BEDROCK_SDK_TOKEN }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
           ECR: ${{ inputs.aws_account }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${{ inputs.ecr_repo }}
         run: |
           docker buildx create --use --name ci-builder --driver docker-container 2>/dev/null || true
+          # BUN_AUTH_TOKEN is only added when GH_PACKAGES_TOKEN is provided (apps with a bun frontend stage).
+          BUN_ARG=""
+          if [ -n "${GH_PACKAGES_TOKEN}" ]; then
+            BUN_ARG="--build-arg BUN_AUTH_TOKEN=${GH_PACKAGES_TOKEN}"
+          fi
           docker buildx build \
             --cache-from type=gha \
             --cache-to   type=gha,mode=max \
             --secret     id=github_token,env=BEDROCK_SDK_TOKEN \
             --build-arg  BEDROCK_SDK_TOKEN="${BEDROCK_SDK_TOKEN}" \
+            ${BUN_ARG} \
             --load \
             -t "${ECR}:${{ github.sha }}" \
             -t "${ECR}:latest" \
